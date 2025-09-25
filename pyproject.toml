@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=80", "wheel", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-can-cannelloni"
+dynamic = ["version"]
+description = "python-can backend for Waveshare 2-CH-CAN-TO-ETH (13-byte TCP wire format over TCP)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Klaudiusz Staniek" }]
+dependencies = ["python-can>=4.2"]
+
+[project.urls]
+Homepage = "https://github.com/kstaniek/python-can-cannelloni"
+Issues = "https://github.com/kstaniek/python-can-cannelloni/issues"
+
+[project.entry-points."can.interface"]
+cannelloni = "can_cannelloni.bus:CannelloniBus"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-timeout>=2.3",
+    "pre-commit==4.3.0",
+    "pre-commit-hooks==6.0.0",
+    "ruff>=0.13",
+    "codespell>=2.4"
+]
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+local_scheme = "no-local-version"
