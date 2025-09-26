@@ -3,12 +3,12 @@ requires = ["setuptools>=80", "wheel", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "python-can-cannelloni"
+name = "can-cannelloni"
 dynamic = ["version"]
-description = "python-can backend for Waveshare 2-CH-CAN-TO-ETH (13-byte TCP wire format over TCP)"
+description = "python-can backend for Cannelloni protocol"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+license = "MIT"
 authors = [{ name = "Klaudiusz Staniek" }]
 dependencies = ["python-can>=4.2"]
 
