@@ -58,7 +58,7 @@ jobs:
       - name: Lint (ruff)
         run: |
           ruff --version
-          ruff check can_waveshare tests --output-format=github || true
+          ruff check can_cannelloni tests --output-format=github || true
 
       - name: Run tests
         run: pytest -q
@@ -69,8 +69,8 @@ jobs:
           import importlib.metadata as md, can
           eps = md.entry_points().select(group='can.interface')
           names = {ep.name for ep in eps}
-          assert 'waveshare' in names, names
-          cls = [ep for ep in eps if ep.name == 'waveshare'][0].load()
+          assert 'cannelloni' in names, names
+          cls = [ep for ep in eps if ep.name == 'cannelloni'][0].load()
           assert issubclass(cls, can.BusABC), cls
           print("Entry point present and loadable:", cls)
           PY
@@ -87,7 +87,7 @@ jobs:
           python - <<'PY'
           import importlib.metadata as md, can
           eps = md.entry_points().select(group='can.interface')
-          assert any(ep.name=='waveshare' for ep in eps), eps
+          assert any(ep.name=='cannelloni' for ep in eps), eps
           print("Installed wheel exposes entry point OK.")
           PY
       
