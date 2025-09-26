@@ -6,6 +6,7 @@ import selectors
 import socket
 import threading
 import time
+import logging
 from typing import Optional, Tuple
 from queue import Queue, Empty
 
@@ -13,11 +14,30 @@ import can
 
 from .protocol import HANDSHAKE, encode_frames, decode_stream
 
+logger = logging.getLogger(__name__)
+
 
 def _parse_channel(channel: str) -> Tuple[str, int]:
-    if ":" not in channel:
-        raise ValueError("channel must be 'host:port'")
-    host, ports = channel.rsplit(":", 1)
+    """Parse channel strings supporting IPv4/host and IPv6 literals.
+
+    Accepted forms:
+      - host:port
+      - 192.0.2.1:2000
+      - [2001:db8::1]:2000
+    """
+    if not channel:
+        raise ValueError("empty channel")
+
+    if channel.startswith("["):
+        rb = channel.find("]")
+        if rb == -1 or rb + 2 > len(channel) or channel[rb + 1] != ":":
+            raise ValueError("channel must be '[ipv6]:port'")
+        host = channel[1:rb]
+        ports = channel[rb + 2 :]
+    else:
+        if ":" not in channel:
+            raise ValueError("channel must be 'host:port' or '[ipv6]:port'")
+        host, ports = channel.rsplit(":", 1)
     return host, int(ports)
 
 
@@ -104,8 +124,13 @@ class CannelloniBus(can.BusABC):
         )
 
         self._connect()
+        logger.info("Connected to %s:%s", self._host, self._port)
         self._alive.set()
         self._rx_thread.start()
+
+    def close(self) -> None:
+        """Alias to shutdown for compatibility."""
+        self.shutdown()
 
     def shutdown(self) -> None:
         self._alive.clear()
@@ -128,6 +153,7 @@ class CannelloniBus(can.BusABC):
                     self._rx_thread.join(timeout=2.0)
             except Exception:
                 pass
+        logger.info("Bus shut down")
 
     def fileno(self) -> int:
         return self._sock.fileno() if self._sock is not None else -1
@@ -187,31 +213,56 @@ class CannelloniBus(can.BusABC):
             sock.settimeout(prev_to)
 
     def _connect(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(self._hs_timeout)
-        if self._nodelay:
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        if self._keepalive:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        last_err: Optional[Exception] = None
+        # Resolve both IPv4 and IPv6
+        try:
+            infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_STREAM)
+        except Exception as e:
+            raise can.CanError(f"address resolution failed: {e}") from e
 
-        s.connect((self._host, self._port))
+        for family, socktype, proto, _canon, sockaddr in infos:
+            s = None
+            try:
+                s = socket.socket(family, socktype, proto)
+                s.settimeout(self._hs_timeout)
+                if self._nodelay:
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if self._keepalive:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
-        # Both peers send the banner (no NUL)
-        s.sendall(HANDSHAKE)
-        peer = self._recv_exact(s, len(HANDSHAKE), self._hs_timeout)
-        if peer != HANDSHAKE:
-            s.close()
-            raise can.CanError(f"Unexpected handshake from server: {peer!r}")
+                s.connect(sockaddr)
 
-        s.settimeout(None)
-        self._sock = s
+                # Both peers send the banner (no NUL)
+                s.sendall(HANDSHAKE)
+                peer = self._recv_exact(s, len(HANDSHAKE), self._hs_timeout)
+                if peer != HANDSHAKE:
+                    raise can.CanError(f"Unexpected handshake from server: {peer!r}")
+
+                s.settimeout(None)
+                self._sock = s
+                return
+            except Exception as e:
+                last_err = e
+                try:
+                    if s is not None:
+                        s.close()
+                except Exception:
+                    pass
+                continue
+
+        # If we got here, all candidates failed
+        if last_err is None:
+            raise can.CanError("no address candidates to connect")
+        raise can.CanError(str(last_err)) from last_err
 
     def _reconnect_blocking(self):
         while self._alive.is_set():
             try:
                 self._connect()
+                logger.info("Reconnected to %s:%s", self._host, self._port)
                 return
-            except Exception:
+            except Exception as e:
+                logger.debug("Reconnect failed: %s", e)
                 time.sleep(self._reconnect_interval)
 
     def _sendall(self, data: bytes, timeout: Optional[float]):
@@ -220,17 +271,29 @@ class CannelloniBus(can.BusABC):
         if timeout is None:
             self._sock.sendall(data)
             return
-        self._sock.settimeout(timeout)
-        try:
-            view = memoryview(data)
-            sent = 0
-            while sent < len(view):
+        deadline = time.monotonic() + float(timeout)
+        view = memoryview(data)
+        sent = 0
+        while sent < len(view):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("send timed out")
+            # Set per-iteration timeout to remaining window
+            self._sock.settimeout(remaining)
+            try:
                 n = self._sock.send(view[sent:])
                 if n == 0:
                     raise OSError("socket closed")
                 sent += n
-        finally:
-            self._sock.settimeout(None)
+            except socket.timeout:
+                # Check again against deadline to normalize exception
+                if deadline - time.monotonic() <= 0:
+                    raise socket.timeout("send timed out")
+                # Otherwise keep looping (rare edge)
+                continue
+            finally:
+                # Restore to blocking after each iteration
+                self._sock.settimeout(None)
 
     def _rx_loop(self):
         def make_selector():
@@ -269,6 +332,7 @@ class CannelloniBus(can.BusABC):
                             sock.close()
                         except OSError:
                             pass
+                        logger.info("Disconnected from %s:%s", self._host, self._port)
                         self._sock = None
                         if not self._reconnect:
                             return
@@ -296,6 +360,13 @@ class CannelloniBus(can.BusABC):
                             except Exception:
                                 # Queue likely full → drop and count
                                 self._drops += 1
+                                if (
+                                    self._drops in (1, 100, 1000)
+                                    or self._drops % 10000 == 0
+                                ):
+                                    logger.warning(
+                                        "RX queue full, dropped %d frames", self._drops
+                                    )
         finally:
             try:
                 sel.close()
