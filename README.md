@@ -140,72 +140,7 @@ bus.set_filters([{"can_id": 0x100, "can_mask": 0x7FF, "extended": False}])
 
 ## Testing
 
-Minimal pytest to validate sending, receiving, and client‑side filtering:
-
-```python
-# tests/test_bus.py
-import socket, struct, threading, time, can
-
-HANDSHAKE = b"CANNELLONIv1"
-EFF=0x80000000; RTR=0x40000000; ERR=0x20000000; SFF=0x7FF; EFFM=0x1FFFFFFF
-def pack_frame(can_id,data,*,extended,rtr=False,err=False):
-    cid = (EFF|(can_id&EFFM)) if extended else (can_id&SFF)
-    if rtr: cid|=RTR
-    if err: cid|=ERR
-    return struct.pack("!IB", cid, len(data)) + data
-
-def make_echo_server():
-    srv=socket.socket(); srv.bind(("127.0.0.1",0)); srv.listen(1); port=srv.getsockname()[1]
-    def run():
-        conn,_=srv.accept()
-        with conn:
-            conn.recv(len(HANDSHAKE)); conn.sendall(HANDSHAKE)
-            while True:
-                hdr=b""
-                while len(hdr)<5:
-                    ch=conn.recv(5-len(hdr))
-                    if not ch: return
-                    hdr+=ch
-                _,ln=struct.unpack("!IB",hdr)
-                payload=b""
-                while len(payload)<ln:
-                    ch=conn.recv(ln-len(payload))
-                    if not ch: return
-                    payload+=ch
-                conn.sendall(hdr+payload)
-    threading.Thread(target=run, daemon=True).start()
-    return srv, port
-
-def test_send_recv_loopback():
-    srv, port = make_echo_server()
-    try:
-        bus = can.Bus(interface="cannelloni", channel=f"127.0.0.1:{port}", receive_own_messages=True)
-        with bus:
-            bus.send(can.Message(arbitration_id=0x123, data=b"ABC", is_extended_id=False))
-            rx = bus.recv(timeout=1.0)
-            assert rx and rx.arbitration_id==0x123 and rx.data==b"ABC" and not rx.is_extended_id
-    finally:
-        srv.close()
-
-def test_filters_drop_nonmatching():
-    srv=socket.socket(); srv.bind(("127.0.0.1",0)); srv.listen(1); port=srv.getsockname()[1]
-    def run():
-        conn,_=srv.accept()
-        with conn:
-            conn.recv(len(HANDSHAKE)); conn.sendall(HANDSHAKE)
-            conn.sendall(pack_frame(0x555,b"\x02",extended=False)+pack_frame(0x100,b"\x01",extended=False))
-            time.sleep(0.1)
-    threading.Thread(target=run, daemon=True).start()
-
-    try:
-        bus = can.Bus(interface="cannelloni", channel=f"127.0.0.1:{port}")
-        with bus:
-            bus.set_filters([{"can_id":0x100,"can_mask":0x7FF,"extended":False}])
-            rx = bus.recv(timeout=1.0)
-            assert rx and rx.arbitration_id==0x100 and rx.data==b"\x01" and not rx.is_extended_id
-    finally:
-        srv.close()
-```
+Minimal pytest to validate sending, receiving, and client‑side filtering.
 
 Run:
 
