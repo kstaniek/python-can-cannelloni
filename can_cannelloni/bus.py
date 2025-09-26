@@ -96,6 +96,7 @@ class CannelloniBus(can.BusABC):
         self._rx_buf = bytearray()
         self._rx_queue: "Queue[can.Message]" = Queue(maxsize=10000)
         self._filters = None
+        self._drops = 0  # count of RX frames dropped due to full queue
 
         self._alive = threading.Event()
         self._rx_thread = threading.Thread(
@@ -121,6 +122,12 @@ class CannelloniBus(can.BusABC):
                 except OSError:
                     pass
             self._sock = None
+            # Ensure RX thread exits and is joined to avoid leaks
+            try:
+                if self._rx_thread.is_alive():
+                    self._rx_thread.join(timeout=2.0)
+            except Exception:
+                pass
 
     def fileno(self) -> int:
         return self._sock.fileno() if self._sock is not None else -1
@@ -158,6 +165,27 @@ class CannelloniBus(can.BusABC):
 
     # --- internals ------------------------------------------------------------
 
+    def _recv_exact(
+        self, sock: socket.socket, n: int, timeout: Optional[float]
+    ) -> bytes:
+        """Read exactly n bytes or raise on timeout/EOF."""
+        prev_to = sock.gettimeout()
+        if timeout is not None:
+            sock.settimeout(timeout)
+        try:
+            buf = bytearray()
+            while len(buf) < n:
+                chunk = sock.recv(n - len(buf))
+                if not chunk:
+                    raise can.CanError("connection closed during handshake")
+                buf.extend(chunk)
+            return bytes(buf)
+        except socket.timeout as e:
+            raise can.CanError("handshake timed out") from e
+        finally:
+            # Restore blocking mode
+            sock.settimeout(prev_to)
+
     def _connect(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(self._hs_timeout)
@@ -170,11 +198,8 @@ class CannelloniBus(can.BusABC):
 
         # Both peers send the banner (no NUL)
         s.sendall(HANDSHAKE)
-        try:
-            peer = s.recv(len(HANDSHAKE))
-        except socket.timeout:
-            peer = b""
-        if peer and peer != HANDSHAKE:
+        peer = self._recv_exact(s, len(HANDSHAKE), self._hs_timeout)
+        if peer != HANDSHAKE:
             s.close()
             raise can.CanError(f"Unexpected handshake from server: {peer!r}")
 
@@ -186,7 +211,7 @@ class CannelloniBus(can.BusABC):
             try:
                 self._connect()
                 return
-            except OSError:
+            except Exception:
                 time.sleep(self._reconnect_interval)
 
     def _sendall(self, data: bytes, timeout: Optional[float]):
@@ -261,10 +286,16 @@ class CannelloniBus(can.BusABC):
                             break
                         del self._rx_buf[:consumed]
                         for m in msgs:
+                            # Apply filters early to avoid queue pressure
+                            if self._filters and not _msg_matches_filters(
+                                m, self._filters
+                            ):
+                                continue
                             try:
                                 self._rx_queue.put_nowait(m)
                             except Exception:
-                                pass
+                                # Queue likely full → drop and count
+                                self._drops += 1
         finally:
             try:
                 sel.close()
