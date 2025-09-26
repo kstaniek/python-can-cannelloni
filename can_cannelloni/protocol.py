@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Klaudiusz Staniek
+
 from __future__ import annotations
 import struct
 from typing import Iterable, List, Tuple
@@ -6,20 +9,17 @@ import can
 # Cannelloni banner (no NUL)
 HANDSHAKE = b"CANNELLONIv1"
 
-# Per-frame record on the TCP stream:
-#   can_id: u32 (big-endian, just the 29/11-bit ID; no kernel flag bits)
-#   flags : u8  (bitfield defined below)
-#   len   : u8  (0..8 classic, 0..64 FD)
-#   data  : len bytes
-_FR_HDR = struct.Struct("!IBB")
+# Linux-style CANID flags in the upper bits (same as SocketCAN)
+CAN_EFF_FLAG = 0x80000000  # Extended frame
+CAN_RTR_FLAG = 0x40000000  # Remote frame
+CAN_ERR_FLAG = 0x20000000  # Error frame
 
-# Flag bits carried in the per-frame header
-FLAG_EFF = 0x80   # extended frame format (29-bit)
-FLAG_RTR = 0x40   # remote frame
-FLAG_ERR = 0x20   # error frame
-FLAG_FD  = 0x10   # CAN FD
-FLAG_BRS = 0x08   # bitrate switch (FD)
-FLAG_ESI = 0x04   # error state indicator (FD)
+CAN_SFF_MASK = 0x000007FF
+CAN_EFF_MASK = 0x1FFFFFFF
+
+# On-wire per-frame header for your server:
+#   u32 CANID (BIG-ENDIAN) | u8 LEN (0..8) | DATA[LEN]
+_FR_HDR = struct.Struct("!IB")
 
 
 class EncodeError(Exception):
@@ -30,31 +30,41 @@ class DecodeError(Exception):
     pass
 
 
-def _pack_flags(msg: can.Message) -> int:
-    f = 0
-    if msg.is_extended_id:        f |= FLAG_EFF
-    if msg.is_remote_frame:       f |= FLAG_RTR
-    if msg.is_error_frame:        f |= FLAG_ERR
-    if getattr(msg, "is_fd", False):          f |= FLAG_FD
-    if getattr(msg, "bitrate_switch", False): f |= FLAG_BRS
-    if getattr(msg, "error_state_indicator", False): f |= FLAG_ESI
-    return f
+def _to_canid(msg: can.Message) -> int:
+    cid = 0
+    if msg.is_extended_id:
+        cid |= CAN_EFF_FLAG | (msg.arbitration_id & CAN_EFF_MASK)
+    else:
+        cid |= msg.arbitration_id & CAN_SFF_MASK
+    if msg.is_remote_frame:
+        cid |= CAN_RTR_FLAG
+    if msg.is_error_frame:
+        cid |= CAN_ERR_FLAG
+    return cid
+
+
+def _from_canid(cid: int) -> tuple[int, bool, bool, bool]:
+    is_ext = bool(cid & CAN_EFF_FLAG)
+    is_rtr = bool(cid & CAN_RTR_FLAG)
+    is_err = bool(cid & CAN_ERR_FLAG)
+    arb = cid & (CAN_EFF_MASK if is_ext else CAN_SFF_MASK)
+    return arb, is_ext, is_rtr, is_err
 
 
 def encode_frames(msgs: Iterable[can.Message]) -> bytes:
-    """
-    Encode one or more CAN(/FD) messages as a TCP byte stream of
-    back-to-back per-frame records: _FR_HDR + payload, with no outer header.
-    """
+    """Encode frames as [BE u32 canid][u8 len][data...] with len<=8."""
     parts: List[bytes] = []
     for m in msgs:
+        if getattr(m, "is_fd", False):
+            raise EncodeError(
+                "CAN-FD not supported on this TCP codec (len must be <= 8)."
+            )
         data = bytes(m.data or b"")
-        if not getattr(m, "is_fd", False) and len(data) > 8:
-            raise EncodeError("Classic CAN frame >8 bytes; set is_fd=True or trim data.")
-        if len(data) > 64:
-            raise EncodeError("CAN-FD payload must be <= 64 bytes.")
-        flags = _pack_flags(m)
-        parts.append(_FR_HDR.pack(m.arbitration_id & 0x1FFFFFFF, flags, len(data)))
+        if m.is_remote_frame and data:
+            raise EncodeError("RTR frame must not carry data.")
+        if len(data) > 8:
+            raise EncodeError("Classic CAN payload must be <= 8 bytes.")
+        parts.append(_FR_HDR.pack(_to_canid(m), len(data)))
         parts.append(data)
     return b"".join(parts)
 
@@ -62,38 +72,49 @@ def encode_frames(msgs: Iterable[can.Message]) -> bytes:
 def decode_stream(buf: bytearray) -> Tuple[int, list[can.Message]]:
     """
     Consume as many complete frames as available from the front of `buf`.
-    Returns (consumed_bytes, [messages]). If no complete frame is present,
-    returns (0, []).
+    Format: [BE u32 canid][u8 len][data...].
+    Returns (consumed_bytes, [messages]); if none ready, returns (0, []).
+    Includes a 1-byte resync if header looks invalid.
     """
     pos = 0
     out: List[can.Message] = []
+    n = len(buf)
 
-    # Need at least frame header
-    while len(buf) - pos >= _FR_HDR.size:
-        can_id, flags, length = _FR_HDR.unpack(buf[pos:pos + _FR_HDR.size])
-        pos += _FR_HDR.size
-
-        # Need the payload
-        if len(buf) - pos < length:
-            # Not enough payload yet: rewind to the start of this header
-            pos -= _FR_HDR.size
+    while True:
+        if n - pos < _FR_HDR.size:
             break
 
-        payload = bytes(buf[pos:pos + length])
-        pos += length
+        canid, ln_raw = _FR_HDR.unpack_from(buf, pos)
+        ln = ln_raw & 0x7F  # server masks to 7 bits; top bit (if any) is ignored
+        if ln > 8:
+            # Not a sane header → shift one byte to resync
+            pos += 1
+            continue
 
+        need = _FR_HDR.size + ln
+        if n - pos < need:
+            # wait for more bytes
+            break
+
+        payload = bytes(buf[pos + _FR_HDR.size : pos + need])
+        pos += need
+
+        arb, is_ext, is_rtr, is_err = _from_canid(canid)
         msg = can.Message(
-            arbitration_id=can_id & 0x1FFFFFFF,
+            arbitration_id=arb,
             data=payload,
-            is_extended_id=bool(flags & FLAG_EFF),
-            is_remote_frame=bool(flags & FLAG_RTR),
-            is_error_frame=bool(flags & FLAG_ERR),
-            is_fd=bool(flags & FLAG_FD),
-            bitrate_switch=bool(flags & FLAG_BRS),
-            error_state_indicator=bool(flags & FLAG_ESI),
+            is_extended_id=is_ext,
+            is_remote_frame=is_rtr,
+            is_error_frame=is_err,
+            is_fd=False,
         )
         out.append(msg)
 
-    if pos == 0:
+        if n - pos < _FR_HDR.size:
+            break
+
+    if not out and pos != 0:
+        return pos, []
+    if not out:
         return 0, []
     return pos, out

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Klaudiusz Staniek
+
 from __future__ import annotations
 import selectors
 import socket
@@ -8,8 +11,7 @@ from queue import Queue, Empty
 
 import can
 
-# ⬇️ import updated helpers (note: no batch/seq anymore)
-from .protocol import HANDSHAKE, encode_frames, decode_stream, DecodeError
+from .protocol import HANDSHAKE, encode_frames, decode_stream
 
 
 def _parse_channel(channel: str) -> Tuple[str, int]:
@@ -17,6 +19,40 @@ def _parse_channel(channel: str) -> Tuple[str, int]:
         raise ValueError("channel must be 'host:port'")
     host, ports = channel.rsplit(":", 1)
     return host, int(ports)
+
+
+def _msg_matches_filters(msg: can.Message, filters) -> bool:
+    """Local filter matcher compatible with python-can filter dicts.
+
+    Each filter is a dict with keys like:
+      - "can_id": int (base id to match against)
+      - "can_mask": int (bitmask)
+      - "extended": bool (whether to match only extended or only standard ids)
+    A message matches if it matches **any** filter in the list.
+    """
+    if not filters:
+        return True
+
+    mid = int(msg.arbitration_id)
+    is_ext = bool(getattr(msg, "is_extended_id", False))
+
+    for f in filters:
+        fid = int(f.get("can_id", 0))
+        mask = f.get("can_mask", None)
+        if mask is None:
+            # Sensible default if not provided
+            mask = 0x1FFFFFFF if is_ext else 0x7FF
+        else:
+            mask = int(mask)
+
+        ext_required = f.get("extended", None)
+        if ext_required is not None and bool(ext_required) != is_ext:
+            continue
+
+        if (mid & mask) == (fid & mask):
+            return True
+
+    return False
 
 
 class CannelloniBus(can.BusABC):
@@ -39,9 +75,10 @@ class CannelloniBus(can.BusABC):
         **kwargs,
     ):
         super().__init__(channel=channel, **kwargs)
-
         if channel and (host or port):
-            raise ValueError("Provide either channel='host:port' or host+port, not both.")
+            raise ValueError(
+                "Provide either channel='host:port' or host+port, not both."
+            )
         if channel:
             host, port = _parse_channel(channel)
         if not host or not port:
@@ -61,7 +98,9 @@ class CannelloniBus(can.BusABC):
         self._filters = None
 
         self._alive = threading.Event()
-        self._rx_thread = threading.Thread(target=self._rx_loop, name="cnl-rx", daemon=True)
+        self._rx_thread = threading.Thread(
+            target=self._rx_loop, name="cnl-rx", daemon=True
+        )
 
         self._connect()
         self._alive.set()
@@ -90,7 +129,7 @@ class CannelloniBus(can.BusABC):
         if self._sock is None:
             raise can.CanError("Not connected")
         try:
-            pkt = encode_frames([msg])   # ⬅️ direct per-frame encoding
+            pkt = encode_frames([msg])  # ⬅️ direct per-frame encoding
             if not pkt:
                 return
             self._sendall(pkt, timeout)
@@ -103,11 +142,19 @@ class CannelloniBus(can.BusABC):
     def recv(self, timeout: Optional[float] = None) -> Optional[can.Message]:
         try:
             msg = self._rx_queue.get(timeout=timeout)
-            if self._filters and not can.util.match_filters([msg], self._filters):
-                return None
-            return msg
         except Empty:
             return None
+
+        if self._filters and not _msg_matches_filters(msg, self._filters):
+            # Drop filtered-out and see if there’s another queued message ready.
+            while True:
+                try:
+                    msg = self._rx_queue.get_nowait()
+                except Empty:
+                    return None
+                if not self._filters or _msg_matches_filters(msg, self._filters):
+                    return msg
+        return msg
 
     # --- internals ------------------------------------------------------------
 
@@ -161,44 +208,65 @@ class CannelloniBus(can.BusABC):
             self._sock.settimeout(None)
 
     def _rx_loop(self):
-        sel = selectors.DefaultSelector()
-        if self._sock is None:
-            return
-        sel.register(self._sock, selectors.EVENT_READ)
+        def make_selector():
+            sel = selectors.DefaultSelector()
+            if self._sock is not None:
+                sel.register(self._sock, selectors.EVENT_READ)
+            return sel
 
-        while self._alive.is_set():
-            try:
+        sel = make_selector()
+
+        try:
+            while self._alive.is_set():
+                # If socket is gone, try to reconnect (if allowed)
+                if self._sock is None:
+                    if not self._reconnect:
+                        break
+                    self._reconnect_blocking()
+                    sel.close()
+                    sel = make_selector()
+                    continue
+
                 events = sel.select(timeout=0.5)
                 if not events:
                     continue
-                sock: socket.socket = events[0].fileobj  # type: ignore
-                chunk = sock.recv(65536)
-                if not chunk:
-                    raise OSError("peer closed")
-                self._rx_buf.extend(chunk)
 
-                # Pull as many complete frames as possible
-                while True:
-                    consumed, msgs = decode_stream(self._rx_buf)
-                    if consumed == 0:
-                        break
-                    del self._rx_buf[:consumed]
-                    for m in msgs:
+                for key, mask in events:
+                    sock: socket.socket = key.fileobj  # SelectorKey.fileobj
+                    try:
+                        chunk = sock.recv(65536)
+                    except OSError:
+                        chunk = b""
+
+                    if not chunk:
+                        # peer closed or error
                         try:
-                            self._rx_queue.put_nowait(m)
-                        except Exception:
+                            sock.close()
+                        except OSError:
                             pass
-            except (OSError, DecodeError):
-                # reconnect if allowed
-                try:
-                    if self._sock:
-                        self._sock.close()
-                except OSError:
-                    pass
-                self._sock = None
-                if not self._reconnect:
-                    break
-                # block until back
-                self._reconnect_blocking()
-                sel.unregister(sock)
-                sel.register(self._sock, selectors.EVENT_READ)
+                        self._sock = None
+                        if not self._reconnect:
+                            return
+                        # Rebuild selector after reconnect
+                        self._reconnect_blocking()
+                        sel.close()
+                        sel = make_selector()
+                        break
+
+                    # Accumulate and decode as many frames as possible
+                    self._rx_buf.extend(chunk)
+                    while True:
+                        consumed, msgs = decode_stream(self._rx_buf)
+                        if consumed == 0:
+                            break
+                        del self._rx_buf[:consumed]
+                        for m in msgs:
+                            try:
+                                self._rx_queue.put_nowait(m)
+                            except Exception:
+                                pass
+        finally:
+            try:
+                sel.close()
+            except Exception:
+                pass
