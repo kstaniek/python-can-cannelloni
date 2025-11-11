@@ -349,7 +349,12 @@ class CannelloniBus(can.BusABC):
                         if consumed == 0:
                             break
                         del self._rx_buf[:consumed]
+                        # Add timestamp to each decoded message
+                        recv_time = time.time()
                         for m in msgs:
+                            # Set timestamp if not already present
+                            if m.timestamp is None or m.timestamp == 0.0:
+                                m.timestamp = recv_time
                             # Apply filters early to avoid queue pressure
                             if self._filters and not _msg_matches_filters(
                                 m, self._filters
