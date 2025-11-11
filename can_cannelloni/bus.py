@@ -353,7 +353,7 @@ class CannelloniBus(can.BusABC):
                         recv_time = time.time()
                         for m in msgs:
                             # Set timestamp if not already present
-                            if m.timestamp == 0.0:
+                            if m.timestamp is None or m.timestamp == 0.0:
                                 m.timestamp = recv_time
                             # Apply filters early to avoid queue pressure
                             if self._filters and not _msg_matches_filters(
